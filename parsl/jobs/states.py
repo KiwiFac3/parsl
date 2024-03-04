@@ -8,21 +8,50 @@ logger = logging.getLogger(__name__)
 
 class JobState(IntEnum):
     """Defines a set of states that a job can be in"""
+
     UNKNOWN = 0
+    """The batch provider is unable to determinate a state for this job"""
+
     PENDING = 1
+    """"This job is in the batch queue but has not started running"""
+
     RUNNING = 2
+    """This job is running in the batch system"""
+
     CANCELLED = 3
+    """This job has been cancelled"""
+
     COMPLETED = 4
+    """This job has completed"""
+
     FAILED = 5
+    """This job has failed"""
+
     TIMEOUT = 6
+    """This job has ended due to walltime expiry. This is different from
+    other error states, because in the pilot job model, a timeout is usually
+    expected and not a failure. Timeouts should not be reported with FAILED
+    state: if they are reported as FAILED, Parsl's error handling code
+    in `simple_error_handler` will eventually regard the batch system as
+    broken and shut down.
+    """
+
     HELD = 7
+    """This job is held/suspended in the batch system"""
+
+    MISSING = 8
+    """This job has reached a terminal state without the resources(managers/workers)
+    launched in the job connecting back to the Executor. This state is set by HTEX
+    when it is able to infer that the block failed to start workers for eg due to
+    bad worker environment or network connectivity issues.
+    """
 
     def __str__(self) -> str:
-        return self.__class__.__name__ + "." + self.name
+        return f"{self.__class__.__name__}.{self.name}"
 
 
 TERMINAL_STATES = [JobState.CANCELLED, JobState.COMPLETED, JobState.FAILED,
-                   JobState.TIMEOUT]
+                   JobState.TIMEOUT, JobState.MISSING]
 
 
 class JobStatus:
@@ -55,16 +84,16 @@ class JobStatus:
 
     def __repr__(self) -> str:
         if self.message is not None:
-            extra = f"state={self.state} message={self.message}".format(self.state, self.message)
+            extra = f"state={self.state} message={self.message}"
         else:
-            extra = f"state={self.state}".format(self.state)
+            extra = f"state={self.state}"
         return f"<{type(self).__module__}.{type(self).__qualname__} object at {hex(id(self))}, {extra}>"
 
     def __str__(self) -> str:
         if self.message is not None:
-            return "{} ({})".format(self.state, self.message)
+            return f"{self.state} ({self.message})"
         else:
-            return "{}".format(self.state)
+            return f"{self.state}"
 
     @property
     def stdout(self) -> Optional[str]:

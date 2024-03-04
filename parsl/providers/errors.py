@@ -1,5 +1,7 @@
 from parsl.errors import ParslError
 
+import warnings
+
 
 class ExecutionProviderException(ParslError):
     """ Base class for all exceptions
@@ -29,7 +31,7 @@ class SchedulerMissingArgs(ExecutionProviderException):
         self.missing_keywords = missing_keywords
         self.sitename = sitename
 
-    def __repr__(self):
+    def __str__(self):
         return "SchedulerMissingArgs: Pool:{0} Arg:{1}".format(self.sitename, self.missing_keywords)
 
 
@@ -41,23 +43,26 @@ class ScriptPathError(ExecutionProviderException):
         self.script_path = script_path
         self.reason = reason
 
-    def __repr__(self):
+    def __str__(self):
         return "Unable to write submit script:{0} Reason:{1}".format(self.script_path, self.reason)
 
 
 class SubmitException(ExecutionProviderException):
-    '''Raised by the submit() method of a provider if there is an error in launching a task.
+    '''Raised by the submit() method of a provider if there is an error in launching a job.
     '''
 
-    def __init__(self, task_name, message, stdout=None, stderr=None):
-        self.task_name = task_name
+    def __init__(self, job_name, message, stdout=None, stderr=None, retcode=None):
+        self.job_name = job_name
         self.message = message
         self.stdout = stdout
         self.stderr = stderr
+        self.retcode = retcode
 
-    def __repr__(self):
+    @property
+    def task_name(self) -> str:
+        warnings.warn("task_name is deprecated; use .job_name instead. This will be removed after 2024-06.", DeprecationWarning)
+        return self.job_name
+
+    def __str__(self) -> str:
         # TODO: make this more user-friendly
-        return "Cannot launch task {0}: {1}; stdout={2}, stderr={3}".format(self.task_name,
-                                                                            self.message,
-                                                                            self.stdout,
-                                                                            self.stderr)
+        return f"Cannot launch job {self.job_name}: {self.message}; recode={self.retcode}, stdout={self.stdout}, stderr={self.stderr}"

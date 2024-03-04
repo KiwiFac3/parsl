@@ -6,23 +6,27 @@ import threading
 import queue
 import datetime
 import pickle
-import warnings
-from multiprocessing import Queue
-from typing import Dict, Sequence  # noqa F401 (used in type annotation)
+from multiprocessing import Process, Queue
+from typing import Dict, Sequence
 from typing import List, Optional, Tuple, Union, Callable
 import math
 
-from parsl.serialize import pack_apply_message, deserialize
+import parsl.launchers
+from parsl.serialize import pack_res_spec_apply_message, deserialize
 from parsl.serialize.errors import SerializationError, DeserializationError
 from parsl.app.errors import RemoteExceptionWrapper
-from parsl.jobs.states import JobStatus
+from parsl.jobs.states import JobStatus, JobState
 from parsl.executors.high_throughput import zmq_pipes
 from parsl.executors.high_throughput import interchange
 from parsl.executors.errors import (
     BadMessage, ScalingFailed,
-    UnsupportedFeatureError
+)
+from parsl.executors.high_throughput.mpi_prefix_composer import (
+    VALID_LAUNCHERS,
+    validate_resource_spec
 )
 
+from parsl import curvezmq
 from parsl.executors.status_handling import BlockProviderExecutor
 from parsl.providers.base import ExecutionProvider
 from parsl.data_provider.staging import Staging
@@ -35,7 +39,24 @@ from parsl.providers import LocalProvider
 
 logger = logging.getLogger(__name__)
 
-_start_methods = ['fork', 'spawn', 'thread']
+DEFAULT_LAUNCH_CMD = ("process_worker_pool.py {debug} {max_workers} "
+                      "-a {addresses} "
+                      "-p {prefetch_capacity} "
+                      "-c {cores_per_worker} "
+                      "-m {mem_per_worker} "
+                      "--poll {poll_period} "
+                      "--task_port={task_port} "
+                      "--result_port={result_port} "
+                      "--cert_dir {cert_dir} "
+                      "--logdir={logdir} "
+                      "--block_id={{block_id}} "
+                      "--hb_period={heartbeat_period} "
+                      "{address_probe_timeout_string} "
+                      "--hb_threshold={heartbeat_threshold} "
+                      "--cpu-affinity {cpu_affinity} "
+                      "{enable_mpi_mode} "
+                      "--mpi-launcher={mpi_launcher} "
+                      "--available-accelerators {accelerators}")
 
 
 class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
@@ -153,16 +174,6 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
 
         default: empty list
 
-    start_method: str
-        What method to use to start new worker processes.
-        HTEx supports "spawn," "fork," and "thread" workers.
-        "Spawn" and "fork" workers are launched in separate processes using different mechanisms,
-        which are described in `Python's multiprocessing documentation.
-        <https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods>`_.
-        "Thread" workers are separate threads of the ``process_worker_pool``, which saves on memory but is
-        only recommended for workloads that involving launching other processes (e.g., ``bash_app`` s).
-        Default: fork
-
     prefetch_capacity : int
         Number of tasks that could be prefetched over available worker capacity.
         When there are a few tasks (<100) or when tasks are long running, this option should
@@ -187,6 +198,20 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
 
     worker_logdir_root : string
         In case of a remote file system, specify the path to where logs will be kept.
+
+    enable_mpi_mode: bool
+        If enabled, MPI launch prefixes will be composed for the batch scheduler based on
+        the nodes available in each batch job and the resource_specification dict passed
+        from the app. This is an experimental feature, please refer to the following doc section
+        before use:  https://parsl.readthedocs.io/en/stable/userguide/mpi_apps.html
+
+    mpi_launcher: str
+        This field is only used if enable_mpi_mode is set. Select one from the
+        list of supported MPI launchers = ("srun", "aprun", "mpiexec").
+        default: "mpiexec"
+
+    encrypted : bool
+        Flag to enable/disable encryption (CurveZMQ). Default is False.
     """
 
     @typeguard.typechecked
@@ -206,20 +231,21 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
                  max_workers: Union[int, float] = float('inf'),
                  cpu_affinity: str = 'none',
                  available_accelerators: Union[int, Sequence[str]] = (),
-                 start_method: str = 'spawn',
                  prefetch_capacity: int = 0,
                  heartbeat_threshold: int = 120,
                  heartbeat_period: int = 30,
                  poll_period: int = 10,
                  address_probe_timeout: Optional[int] = None,
                  worker_logdir_root: Optional[str] = None,
-                 block_error_handler: Union[bool, Callable[[BlockProviderExecutor, Dict[str, JobStatus]], None]] = True):
+                 enable_mpi_mode: bool = False,
+                 mpi_launcher: str = "mpiexec",
+                 block_error_handler: Union[bool, Callable[[BlockProviderExecutor, Dict[str, JobStatus]], None]] = True,
+                 encrypted: bool = False):
 
         logger.debug("Initializing HighThroughputExecutor")
 
         BlockProviderExecutor.__init__(self, provider=provider, block_error_handler=block_error_handler)
         self.label = label
-        self.launch_cmd = launch_cmd
         self.worker_debug = worker_debug
         self.storage_access = storage_access
         self.working_dir = working_dir
@@ -229,7 +255,6 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         self.prefetch_capacity = prefetch_capacity
         self.address = address
         self.address_probe_timeout = address_probe_timeout
-        self.start_method = start_method
         if self.address:
             self.all_addresses = address
         else:
@@ -252,17 +277,6 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
             available_accelerators = list(map(str, range(available_accelerators)))
         self.available_accelerators = list(available_accelerators)
 
-        # Raise errors for incompatible settings
-        if start_method not in _start_methods:
-            raise ValueError(f'Start method "{start_method}" not recognized. Expected one of: {", ".join(_start_methods)}')
-        if start_method == "thread" and cpu_affinity != "none":
-            raise ValueError('Thread affinity is not available with start method: "thread"')
-        if start_method == "thread" and len(available_accelerators) > 0:
-            raise ValueError('Accelerator pinning not available with start method: "thread"')
-        if start_method == "fork":
-            logger.warning("The 'fork' start method is deprecated")
-            warnings.warn("The 'fork' start method is deprecated")
-
         # Determine the number of workers per node
         self._workers_per_node = min(max_workers, mem_slots, cpu_slots)
         if len(self.available_accelerators) > 0:
@@ -276,6 +290,7 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         self.hub_port = None  # set to the correct hub port in dfk
         self.worker_ports = worker_ports
         self.worker_port_range = worker_port_range
+        self.interchange_proc: Optional[Process] = None
         self.interchange_port_range = interchange_port_range
         self.heartbeat_threshold = heartbeat_threshold
         self.heartbeat_period = heartbeat_period
@@ -283,39 +298,44 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         self.run_dir = '.'
         self.worker_logdir_root = worker_logdir_root
         self.cpu_affinity = cpu_affinity
+        self.encrypted = encrypted
+        self.cert_dir = None
+
+        self.enable_mpi_mode = enable_mpi_mode
+        assert mpi_launcher in VALID_LAUNCHERS, \
+            f"mpi_launcher must be set to one of {VALID_LAUNCHERS}"
+        if self.enable_mpi_mode:
+            assert isinstance(self.provider.launcher, parsl.launchers.SingleNodeLauncher), \
+                "mpi_mode requires the provider to be configured to use a SingleNodeLauncher"
+
+        self.mpi_launcher = mpi_launcher
 
         if not launch_cmd:
-            self.launch_cmd = ("process_worker_pool.py {debug} {max_workers} "
-                               "-a {addresses} "
-                               "-p {prefetch_capacity} "
-                               "-c {cores_per_worker} "
-                               "-m {mem_per_worker} "
-                               "--poll {poll_period} "
-                               "--task_port={task_port} "
-                               "--result_port={result_port} "
-                               "--logdir={logdir} "
-                               "--block_id={{block_id}} "
-                               "--hb_period={heartbeat_period} "
-                               "{address_probe_timeout_string} "
-                               "--hb_threshold={heartbeat_threshold} "
-                               "--cpu-affinity {cpu_affinity} "
-                               "--available-accelerators {accelerators} "
-                               "--start-method {start_method}")
+            launch_cmd = DEFAULT_LAUNCH_CMD
+        self.launch_cmd = launch_cmd
 
     radio_mode = "htex"
+
+    @property
+    def logdir(self):
+        return "{}/{}".format(self.run_dir, self.label)
+
+    @property
+    def worker_logdir(self):
+        if self.worker_logdir_root is not None:
+            return "{}/{}".format(self.worker_logdir_root, self.label)
+        return self.logdir
 
     def initialize_scaling(self):
         """Compose the launch command and scale out the initial blocks.
         """
         debug_opts = "--debug" if self.worker_debug else ""
         max_workers = "" if self.max_workers == float('inf') else "--max_workers={}".format(self.max_workers)
+        enable_mpi_opts = "--enable_mpi_mode " if self.enable_mpi_mode else ""
 
         address_probe_timeout_string = ""
         if self.address_probe_timeout:
             address_probe_timeout_string = "--address_probe_timeout={}".format(self.address_probe_timeout)
-        worker_logdir = "{}/{}".format(self.run_dir, self.label)
-        if self.worker_logdir_root is not None:
-            worker_logdir = "{}/{}".format(self.worker_logdir_root, self.label)
 
         l_cmd = self.launch_cmd.format(debug=debug_opts,
                                        prefetch_capacity=self.prefetch_capacity,
@@ -330,10 +350,12 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
                                        heartbeat_period=self.heartbeat_period,
                                        heartbeat_threshold=self.heartbeat_threshold,
                                        poll_period=self.poll_period,
-                                       logdir=worker_logdir,
+                                       cert_dir=self.cert_dir,
+                                       logdir=self.worker_logdir,
                                        cpu_affinity=self.cpu_affinity,
-                                       accelerators=" ".join(self.available_accelerators),
-                                       start_method=self.start_method)
+                                       enable_mpi_mode=enable_mpi_opts,
+                                       mpi_launcher=self.mpi_launcher,
+                                       accelerators=" ".join(self.available_accelerators))
         self.launch_cmd = l_cmd
         logger.debug("Launch command: {}".format(self.launch_cmd))
 
@@ -352,9 +374,25 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
     def start(self):
         """Create the Interchange process and connect to it.
         """
-        self.outgoing_q = zmq_pipes.TasksOutgoing("127.0.0.1", self.interchange_port_range)
-        self.incoming_q = zmq_pipes.ResultsIncoming("127.0.0.1", self.interchange_port_range)
-        self.command_client = zmq_pipes.CommandClient("127.0.0.1", self.interchange_port_range)
+        if self.encrypted and self.cert_dir is None:
+            logger.debug("Creating CurveZMQ certificates")
+            self.cert_dir = curvezmq.create_certificates(self.logdir)
+        elif not self.encrypted and self.cert_dir:
+            raise AttributeError(
+                "The certificates directory path attribute (cert_dir) is defined, but the "
+                "encrypted attribute is set to False. You must either change cert_dir to "
+                "None or encrypted to True."
+            )
+
+        self.outgoing_q = zmq_pipes.TasksOutgoing(
+            curvezmq.ClientContext(self.cert_dir), "127.0.0.1", self.interchange_port_range
+        )
+        self.incoming_q = zmq_pipes.ResultsIncoming(
+            curvezmq.ClientContext(self.cert_dir), "127.0.0.1", self.interchange_port_range
+        )
+        self.command_client = zmq_pipes.CommandClient(
+            curvezmq.ClientContext(self.cert_dir), "127.0.0.1", self.interchange_port_range
+        )
 
         self._queue_management_thread = None
         self._start_queue_management_thread()
@@ -475,10 +513,11 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
                                                     "worker_port_range": self.worker_port_range,
                                                     "hub_address": self.hub_address,
                                                     "hub_port": self.hub_port,
-                                                    "logdir": "{}/{}".format(self.run_dir, self.label),
+                                                    "logdir": self.logdir,
                                                     "heartbeat_threshold": self.heartbeat_threshold,
                                                     "poll_period": self.poll_period,
-                                                    "logging_level": logging.DEBUG if self.worker_debug else logging.INFO
+                                                    "logging_level": logging.DEBUG if self.worker_debug else logging.INFO,
+                                                    "cert_dir": self.cert_dir,
                                                     },
                                             daemon=True,
                                             name="HTEX-Interchange"
@@ -539,6 +578,10 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         """
         return self.command_client.run("MANAGERS")
 
+    def connected_blocks(self) -> List[str]:
+        """List of connected block ids"""
+        return self.command_client.run("CONNECTED_BLOCKS")
+
     def _hold_block(self, block_id):
         """ Sends hold command to all managers which are in a specific block
 
@@ -573,10 +616,7 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         Returns:
               Future
         """
-        if resource_specification:
-            logger.error("Ignoring the call specification. "
-                         "Parsl call specification is not supported in HighThroughput Executor.")
-            raise UnsupportedFeatureError('resource specification', 'HighThroughput Executor', None)
+        validate_resource_spec(resource_specification)
 
         if self.bad_state_is_set:
             raise self.executor_exception
@@ -585,18 +625,18 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         task_id = self._task_counter
 
         # handle people sending blobs gracefully
-        args_to_print = args
-        if logger.getEffectiveLevel() >= logging.DEBUG:
-            args_to_print = tuple([arg if len(repr(arg)) < 100 else (repr(arg)[:100] + '...') for arg in args])
-        logger.debug("Pushing function {} to queue with args {}".format(func, args_to_print))
+        if logger.getEffectiveLevel() <= logging.DEBUG:
+            args_to_print = tuple([ar if len(ar := repr(arg)) < 100 else (ar[:100] + '...') for arg in args])
+            logger.debug("Pushing function {} to queue with args {}".format(func, args_to_print))
 
         fut = Future()
         fut.parsl_executor_task_id = task_id
         self.tasks[task_id] = fut
 
         try:
-            fn_buf = pack_apply_message(func, args, kwargs,
-                                        buffer_threshold=1024 * 1024)
+            fn_buf = pack_res_spec_apply_message(func, args, kwargs,
+                                                 resource_specification=resource_specification,
+                                                 buffer_threshold=1024 * 1024)
         except TypeError:
             raise SerializationError(func.__name__)
 
@@ -628,7 +668,7 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
     def workers_per_node(self) -> Union[int, float]:
         return self._workers_per_node
 
-    def scale_in(self, blocks=None, block_ids=[], force=True, max_idletime=None):
+    def scale_in(self, blocks, max_idletime=None):
         """Scale in the number of active blocks by specified amount.
 
         The scale in method here is very rude. It doesn't give the workers
@@ -641,57 +681,47 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         blocks : int
              Number of blocks to terminate and scale_in by
 
-        force : Bool
-             Used along with blocks to indicate whether blocks should be terminated by force.
-             When force = True, we will kill blocks regardless of the blocks being busy
-             When force = False, Only idle blocks will be terminated.
-             If the # of ``idle_blocks`` < ``blocks``, the list of jobs marked for termination
-             will be in the range: 0 - ``blocks``.
-
         max_idletime: float
-             A time to indicate how long a block can be idle.
-             Used along with force = False to kill blocks that have been idle for that long.
+             A time to indicate how long a block should be idle to be a
+             candidate for scaling in.
 
-        block_ids : list
-             List of specific block ids to terminate. Optional
+             If None then blocks will be force scaled in even if they are busy.
+
+             If a float, then only idle blocks will be terminated, which may be less than
+             the requested number.
 
         Returns
         -------
-        List of job_ids marked for termination
+        List of block IDs scaled in
         """
-        logger.debug(f"Scale in called, blocks={blocks}, block_ids={block_ids}")
-        if block_ids:
-            block_ids_to_kill = block_ids
-        else:
-            managers = self.connected_managers()
-            block_info = {}  # block id -> list( tasks, idle duration )
-            for manager in managers:
-                if not manager['active']:
-                    continue
-                b_id = manager['block_id']
-                if b_id not in block_info:
-                    block_info[b_id] = [0, float('inf')]
-                block_info[b_id][0] += manager['tasks']
-                block_info[b_id][1] = min(block_info[b_id][1], manager['idle_duration'])
+        logger.debug(f"Scale in called, blocks={blocks}")
+        managers = self.connected_managers()
+        block_info = {}  # block id -> list( tasks, idle duration )
+        for manager in managers:
+            if not manager['active']:
+                continue
+            b_id = manager['block_id']
+            if b_id not in block_info:
+                block_info[b_id] = [0, float('inf')]
+            block_info[b_id][0] += manager['tasks']
+            block_info[b_id][1] = min(block_info[b_id][1], manager['idle_duration'])
 
-            sorted_blocks = sorted(block_info.items(), key=lambda item: (item[1][1], item[1][0]))
-            logger.debug(f"Scale in selecting from {len(sorted_blocks)} blocks")
-            if force is True:
-                block_ids_to_kill = [x[0] for x in sorted_blocks[:blocks]]
-            else:
-                if not max_idletime:
-                    block_ids_to_kill = [x[0] for x in sorted_blocks if x[1][0] == 0][:blocks]
-                else:
-                    block_ids_to_kill = []
-                    for x in sorted_blocks:
-                        if x[1][1] > max_idletime and x[1][0] == 0:
-                            block_ids_to_kill.append(x[0])
-                            if len(block_ids_to_kill) == blocks:
-                                break
-                logger.debug("Selected idle block ids to kill: {}".format(
-                    block_ids_to_kill))
-                if len(block_ids_to_kill) < blocks:
-                    logger.warning(f"Could not find enough blocks to kill: wanted {blocks} but only selected {len(block_ids_to_kill)}")
+        sorted_blocks = sorted(block_info.items(), key=lambda item: (item[1][1], item[1][0]))
+        logger.debug(f"Scale in selecting from {len(sorted_blocks)} blocks")
+        if max_idletime is None:
+            block_ids_to_kill = [x[0] for x in sorted_blocks[:blocks]]
+        else:
+            block_ids_to_kill = []
+            for x in sorted_blocks:
+                if x[1][1] > max_idletime and x[1][0] == 0:
+                    block_ids_to_kill.append(x[0])
+                    if len(block_ids_to_kill) == blocks:
+                        break
+
+            logger.debug("Selected idle block ids to kill: {}".format(
+                block_ids_to_kill))
+            if len(block_ids_to_kill) < blocks:
+                logger.warning(f"Could not find enough blocks to kill: wanted {blocks} but only selected {len(block_ids_to_kill)}")
 
         # Hold the block
         for block_id in block_ids_to_kill:
@@ -716,12 +746,43 @@ class HighThroughputExecutor(BlockProviderExecutor, RepresentationMixin):
         launch_cmd = self.launch_cmd.format(block_id=block_id)
         return launch_cmd
 
-    def shutdown(self):
+    def status(self) -> Dict[str, JobStatus]:
+        job_status = super().status()
+        connected_blocks = self.connected_blocks()
+        for job_id in job_status:
+            job_info = job_status[job_id]
+            if job_info.terminal and job_id not in connected_blocks:
+                job_status[job_id].state = JobState.MISSING
+                if job_status[job_id].message is None:
+                    job_status[job_id].message = (
+                        "Job is marked as MISSING since the workers failed to register "
+                        "to the executor. Check the stdout/stderr logs in the submit_scripts "
+                        "directory for more debug information"
+                    )
+        return job_status
+
+    def shutdown(self, timeout: float = 10.0):
         """Shutdown the executor, including the interchange. This does not
         shut down any workers directly - workers should be terminated by the
         scaling mechanism or by heartbeat timeout.
+
+        Parameters
+        ----------
+
+        timeout : float
+            Amount of time to wait for the Interchange process to terminate before
+            we forcefully kill it.
         """
+        if self.interchange_proc is None:
+            logger.info("HighThroughputExecutor has not started; skipping shutdown")
+            return
 
         logger.info("Attempting HighThroughputExecutor shutdown")
+
         self.interchange_proc.terminate()
+        self.interchange_proc.join(timeout=timeout)
+        if self.interchange_proc.is_alive():
+            logger.info("Unable to terminate Interchange process; sending SIGKILL")
+            self.interchange_proc.kill()
+
         logger.info("Finished HighThroughputExecutor shutdown attempt")
