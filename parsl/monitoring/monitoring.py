@@ -451,6 +451,16 @@ class MonitoringRouter:
               resource_msgs: "queue.Queue[AddressedMonitoringMessage]") -> None:
         try:
             router_keep_going = True
+
+            if self.feedback_address:
+                zmq_context = zmq.Context()
+
+                # Initialize a REQ socket and connect to the specified netloc
+                zmq_socket = zmq_context.socket(zmq.PUSH)
+                zmq_socket.setsockopt(zmq.SNDTIMEO, 1000)
+                zmq_socket.setsockopt(zmq.LINGER, 1000)
+                zmq_socket.connect("tcp://" + self.feedback_address + ":5557")
+
             while router_keep_going:
                 try:
                     data, addr = self.sock.recvfrom(2048)
@@ -473,7 +483,9 @@ class MonitoringRouter:
 
                         msg_0: AddressedMonitoringMessage
                         msg_0 = (msg, 0)
+                        message_type, task_data = msg
 
+                        attributes_to_print = ['task_id', 'task_time_invoked', 'task_time_returned', 'task_depends']
                         if msg[0] == MessageType.NODE_INFO:
                             msg[1]['run_id'] = self.run_id
                             node_msgs.put(msg_0)
@@ -482,18 +494,22 @@ class MonitoringRouter:
                         elif msg[0] == MessageType.BLOCK_INFO:
                             block_msgs.put(msg_0)
                         elif msg[0] == MessageType.TASK_INFO:
+                            if task_data['task_status_name'] == 'exec_done' and self.feedback_address:
+                                # Constructing a dictionary with specified attributes and their values
+                                feedback_json = {attr: task_data[attr] for attr in attributes_to_print}
+
+                                # Converting the dictionary to a JSON string with custom serialization for datetime
+                                # objects
+                                feedback_json_str = json.dumps(feedback_json, indent=4, default=_datetime_serializer)
+                                zmq_socket.send_string(feedback_json_str)
+
                             priority_msgs.put(msg_0)
                         elif msg[0] == MessageType.WORKFLOW_INFO:
                             priority_msgs.put(msg_0)
                             if 'exit_now' in msg[1] and msg[1]['exit_now']:
                                 router_keep_going = False
                         else:
-                            # There is a type: ignore here because if msg[0]
-                            # is of the correct type, this code is unreachable,
-                            # but there is no verification that the message
-                            # received from ic_channel.recv_pyobj() is actually
-                            # of that type.
-                            self.logger.error(f"Discarding message from interchange with unknown type {msg[0].value}")  # type: ignore[unreachable]
+                            self.logger.error(f"Discarding message from interchange with unknown type {msg[0].value}")
                 except zmq.Again:
                     pass
                 except Exception:
@@ -516,7 +532,11 @@ class MonitoringRouter:
                     pass
 
             self.logger.info("Monitoring router finishing normally")
+
         finally:
+            if self.feedback_address:
+                zmq_socket.close()
+                zmq_context.term()
             self.logger.info("Monitoring router finished")
 
 
